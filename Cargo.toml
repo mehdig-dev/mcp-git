@@ -1,0 +1,26 @@
+[package]
+name = "mcp-git"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "MCP server that lets LLMs explore and search Git repositories"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mehdig-dev/mcp-git"
+homepage = "https://github.com/mehdig-dev/mcp-git"
+keywords = ["mcp", "git", "llm", "ai", "version-control"]
+categories = ["development-tools", "command-line-utilities"]
+readme = "README.md"
+exclude = [".github/", ".claude/"]
+
+[dependencies]
+rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
+gix = { version = "0.70", default-features = false, features = ["basic", "revision"] }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
