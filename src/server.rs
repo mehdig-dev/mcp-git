@@ -18,7 +18,6 @@ pub struct RepoEntry {
 #[derive(Clone)]
 pub struct McpGitServer {
     repos: Arc<Vec<RepoEntry>>,
-    #[allow(dead_code)]
     max_diff_lines: u32,
     max_log_entries: u32,
     tool_router: ToolRouter<Self>,
@@ -118,7 +117,6 @@ impl McpGitServer {
 
     fn open_repo(&self, entry: &RepoEntry) -> Result<gix::Repository, McpGitError> {
         gix::discover(&entry.path)
-            .map(|r| r.into())
             .map_err(|e| McpGitError::Git(format!("Cannot open repository '{}': {}", entry.name, e)))
     }
 
@@ -127,13 +125,10 @@ impl McpGitServer {
     }
 }
 
-#[tool_router]
+// -- Public methods for testability --
+
 impl McpGitServer {
-    #[tool(
-        name = "list_repos",
-        description = "List all connected Git repositories with their paths and current branch"
-    )]
-    async fn list_repos(&self) -> Result<CallToolResult, ErrorData> {
+    pub fn do_list_repos(&self) -> Result<CallToolResult, ErrorData> {
         let mut results = Vec::new();
         for entry in self.repos.iter() {
             let branch = match self.open_repo(entry) {
@@ -158,14 +153,7 @@ impl McpGitServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "log",
-        description = "Show commit history for a repository. Returns commit SHA, author, date, and message."
-    )]
-    async fn log(
-        &self,
-        Parameters(params): Parameters<LogParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub fn do_log(&self, params: LogParams) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.repo.as_deref()).map_err(|e| self.err(e))?;
         let repo = self.open_repo(entry).map_err(|e| self.err(e))?;
 
@@ -183,8 +171,8 @@ impl McpGitServer {
             .all()
             .map_err(|e| self.err(McpGitError::Git(e.to_string())))?;
 
-        for (i, info) in walk.enumerate() {
-            if i >= max as usize {
+        for info in walk {
+            if commits.len() >= max as usize {
                 break;
             }
             let info = info.map_err(|e| self.err(McpGitError::Git(e.to_string())))?;
@@ -224,14 +212,7 @@ impl McpGitServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "diff",
-        description = "Show the diff between two refs (commits, branches, or tags)"
-    )]
-    async fn diff(
-        &self,
-        Parameters(params): Parameters<DiffParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub fn do_diff(&self, params: DiffParams) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.repo.as_deref()).map_err(|e| self.err(e))?;
         let repo = self.open_repo(entry).map_err(|e| self.err(e))?;
 
@@ -243,7 +224,6 @@ impl McpGitServer {
             .rev_parse_single(gix::bstr::BStr::new(to_ref.as_bytes()))
             .map_err(|e| self.err(McpGitError::InvalidRef(format!("{}: {}", to_ref, e))))?;
 
-        // Use git diff-tree via the repo to find changed files between two commits
         let from_commit = repo
             .find_object(from)
             .map_err(|e| self.err(McpGitError::Git(e.to_string())))?
@@ -255,30 +235,63 @@ impl McpGitServer {
             .try_into_commit()
             .map_err(|e| self.err(McpGitError::Git(e.to_string())))?;
 
-        let changes = serde_json::json!({
-            "from_sha": from_commit.id().to_string(),
-            "to_sha": to_commit.id().to_string(),
-            "from_message": from_commit.message_raw_sloppy().to_string().trim().to_string(),
-            "to_message": to_commit.message_raw_sloppy().to_string().trim().to_string(),
-        });
+        let from_tree = from_commit
+            .tree()
+            .map_err(|e| self.err(McpGitError::Git(e.to_string())))?;
+        let to_tree = to_commit
+            .tree()
+            .map_err(|e| self.err(McpGitError::Git(e.to_string())))?;
+
+        // Compute tree diff to find changed files
+        use gix::object::tree::diff::{Action as DiffAction, Change as DiffChange};
+        let mut changes = Vec::new();
+        let max_files = self.max_diff_lines as usize;
+
+        from_tree
+            .changes()
+            .map_err(|e| self.err(McpGitError::Git(e.to_string())))?
+            .for_each_to_obtain_tree(&to_tree, |change: DiffChange<'_, '_, '_>| {
+                let path = change.location().to_string();
+
+                // Apply path filter if specified
+                if let Some(ref filter_path) = params.path {
+                    if !path.starts_with(filter_path.as_str()) {
+                        return Ok::<_, std::convert::Infallible>(DiffAction::Continue);
+                    }
+                }
+
+                let change_type = match &change {
+                    DiffChange::Addition { .. } => "added",
+                    DiffChange::Deletion { .. } => "deleted",
+                    DiffChange::Modification { .. } => "modified",
+                    DiffChange::Rewrite { copy: true, .. } => "copied",
+                    DiffChange::Rewrite { .. } => "renamed",
+                };
+
+                if changes.len() < max_files {
+                    changes.push(serde_json::json!({
+                        "path": path,
+                        "change": change_type,
+                    }));
+                }
+
+                Ok(DiffAction::Continue)
+            })
+            .map_err(|e| self.err(McpGitError::Git(e.to_string())))?;
 
         let text = serde_json::to_string_pretty(&serde_json::json!({
             "from": params.from_ref,
             "to": to_ref,
-            "details": changes,
+            "from_sha": from_commit.id().to_string(),
+            "to_sha": to_commit.id().to_string(),
+            "files": changes,
+            "file_count": changes.len(),
         }))
         .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "show_commit",
-        description = "Show details of a specific commit including message, author, date, and files changed"
-    )]
-    async fn show_commit(
-        &self,
-        Parameters(params): Parameters<CommitParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub fn do_show_commit(&self, params: CommitParams) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.repo.as_deref()).map_err(|e| self.err(e))?;
         let repo = self.open_repo(entry).map_err(|e| self.err(e))?;
 
@@ -314,14 +327,7 @@ impl McpGitServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "list_branches",
-        description = "List all branches in the repository with current branch marked"
-    )]
-    async fn list_branches(
-        &self,
-        Parameters(params): Parameters<RepoParam>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub fn do_list_branches(&self, params: RepoParam) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.repo.as_deref()).map_err(|e| self.err(e))?;
         let repo = self.open_repo(entry).map_err(|e| self.err(e))?;
 
@@ -370,14 +376,7 @@ impl McpGitServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        name = "search_commits",
-        description = "Search commit messages for a given query string"
-    )]
-    async fn search_commits(
-        &self,
-        Parameters(params): Parameters<SearchParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub fn do_search_commits(&self, params: SearchParams) -> Result<CallToolResult, ErrorData> {
         let entry = self.resolve(params.repo.as_deref()).map_err(|e| self.err(e))?;
         let repo = self.open_repo(entry).map_err(|e| self.err(e))?;
         let max = params.max_count.unwrap_or(self.max_log_entries);
@@ -425,6 +424,74 @@ impl McpGitServer {
         }))
         .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+}
+
+// -- MCP tool handlers (thin wrappers) --
+
+#[tool_router]
+impl McpGitServer {
+    #[tool(
+        name = "list_repos",
+        description = "List all connected Git repositories with their paths and current branch"
+    )]
+    async fn list_repos(&self) -> Result<CallToolResult, ErrorData> {
+        self.do_list_repos()
+    }
+
+    #[tool(
+        name = "log",
+        description = "Show commit history for a repository. Returns commit SHA, author, date, and message."
+    )]
+    async fn log(
+        &self,
+        Parameters(params): Parameters<LogParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_log(params)
+    }
+
+    #[tool(
+        name = "diff",
+        description = "Show the diff between two refs (commits, branches, or tags)"
+    )]
+    async fn diff(
+        &self,
+        Parameters(params): Parameters<DiffParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_diff(params)
+    }
+
+    #[tool(
+        name = "show_commit",
+        description = "Show details of a specific commit including message, author, date, and files changed"
+    )]
+    async fn show_commit(
+        &self,
+        Parameters(params): Parameters<CommitParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_show_commit(params)
+    }
+
+    #[tool(
+        name = "list_branches",
+        description = "List all branches in the repository with current branch marked"
+    )]
+    async fn list_branches(
+        &self,
+        Parameters(params): Parameters<RepoParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_list_branches(params)
+    }
+
+    #[tool(
+        name = "search_commits",
+        description = "Search commit messages for a given query string"
+    )]
+    async fn search_commits(
+        &self,
+        Parameters(params): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.do_search_commits(params)
     }
 }
 
