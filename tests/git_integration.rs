@@ -1,7 +1,8 @@
 mod common;
 
 use mcp_git::server::{
-    CommitParams, DiffParams, LogParams, McpGitServer, RepoEntry, RepoParam, SearchParams,
+    CommitParams, DiffParams, FileAtRefParams, LogParams, McpGitServer, RepoEntry, RepoParam,
+    SearchParams,
 };
 
 fn make_server(repo: &common::TestRepo) -> McpGitServer {
@@ -319,4 +320,185 @@ fn test_resolve_not_found() {
     };
     let result = server.do_list_branches(params);
     assert!(result.is_err(), "resolve with wrong name should fail");
+}
+
+// -- New tool tests --
+
+#[test]
+fn test_status_clean() {
+    let repo = common::TestRepo::new();
+    let server = make_server(&repo);
+
+    let params = RepoParam { repo: None };
+    let result = server.do_status(params).expect("status failed");
+    let json = extract_text(result);
+
+    assert_eq!(json["is_clean"], true);
+    assert_eq!(json["staged"].as_array().unwrap().len(), 0);
+    assert_eq!(json["unstaged"].as_array().unwrap().len(), 0);
+    assert_eq!(json["untracked"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn test_status_modified() {
+    let repo = common::TestRepo::new();
+    let server = make_server(&repo);
+
+    // Modify a tracked file
+    std::fs::write(repo.path().join("README.md"), "# Modified\n").unwrap();
+
+    let params = RepoParam { repo: None };
+    let result = server.do_status(params).expect("status failed");
+    let json = extract_text(result);
+
+    assert_eq!(json["is_clean"], false);
+    let unstaged = json["unstaged"].as_array().unwrap();
+    assert!(
+        unstaged.iter().any(|e| e["path"] == "README.md"),
+        "README.md should show as unstaged modified"
+    );
+}
+
+#[test]
+fn test_get_file_contents() {
+    let repo = common::TestRepo::new();
+    let server = make_server(&repo);
+
+    let params = FileAtRefParams {
+        repo: None,
+        path: "README.md".to_string(),
+        rev: None,
+    };
+    let result = server
+        .do_get_file_contents(params)
+        .expect("get_file_contents failed");
+    let json = extract_text(result);
+
+    assert_eq!(json["path"], "README.md");
+    assert_eq!(json["content"], "# Test\n");
+    assert_eq!(json["size"], 7);
+}
+
+#[test]
+fn test_get_file_contents_at_ref() {
+    let repo = common::TestRepo::new();
+    let server = make_server(&repo);
+
+    // Get the oldest commit SHA (which only has README.md)
+    let log_params = LogParams {
+        repo: None,
+        max_count: Some(10),
+        branch: None,
+        author: None,
+    };
+    let log_result = server.do_log(log_params).expect("log failed");
+    let log_json = extract_text(log_result);
+    let commits = log_json["commits"].as_array().unwrap();
+    let oldest_sha = commits.last().unwrap()["sha"].as_str().unwrap().to_string();
+
+    // src/main.rs should NOT exist at the oldest commit
+    let params = FileAtRefParams {
+        repo: None,
+        path: "src/main.rs".to_string(),
+        rev: Some(oldest_sha),
+    };
+    let result = server.do_get_file_contents(params);
+    assert!(
+        result.is_err(),
+        "src/main.rs should not exist at the oldest commit"
+    );
+}
+
+#[test]
+fn test_get_file_contents_not_found() {
+    let repo = common::TestRepo::new();
+    let server = make_server(&repo);
+
+    let params = FileAtRefParams {
+        repo: None,
+        path: "nonexistent.txt".to_string(),
+        rev: None,
+    };
+    let result = server.do_get_file_contents(params);
+    assert!(result.is_err(), "nonexistent file should return error");
+}
+
+#[test]
+fn test_list_tags() {
+    let repo = common::TestRepo::new();
+
+    // Create tags using git CLI
+    let path = repo.path();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&path)
+            .env("GIT_COMMITTER_NAME", "Alice")
+            .env("GIT_COMMITTER_EMAIL", "alice@test.com")
+            .output()
+            .expect("git command failed")
+    };
+    git(&["tag", "v1.0"]);
+    git(&["tag", "-a", "v2.0", "-m", "Release 2.0"]);
+
+    let server = make_server(&repo);
+    let params = RepoParam { repo: None };
+    let result = server.do_list_tags(params).expect("list_tags failed");
+    let json = extract_text(result);
+
+    assert_eq!(json["count"], 2);
+    let tags = json["tags"].as_array().unwrap();
+    let tag_names: Vec<&str> = tags.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(tag_names.contains(&"v1.0"), "should contain v1.0");
+    assert!(tag_names.contains(&"v2.0"), "should contain v2.0");
+}
+
+#[test]
+fn test_get_remote_info() {
+    let repo = common::TestRepo::new();
+
+    // Add a remote
+    let path = repo.path();
+    std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/test.git",
+        ])
+        .current_dir(&path)
+        .output()
+        .expect("git remote add failed");
+
+    let server = make_server(&repo);
+    let params = RepoParam { repo: None };
+    let result = server
+        .do_get_remote_info(params)
+        .expect("get_remote_info failed");
+    let json = extract_text(result);
+
+    assert_eq!(json["count"], 1);
+    let remotes = json["remotes"].as_array().unwrap();
+    assert_eq!(remotes[0]["name"], "origin");
+    assert_eq!(remotes[0]["fetch_url"], "https://example.com/test.git");
+}
+
+#[test]
+fn test_blame() {
+    let repo = common::TestRepo::new();
+    let server = make_server(&repo);
+
+    let params = FileAtRefParams {
+        repo: None,
+        path: "README.md".to_string(),
+        rev: None,
+    };
+    let result = server.do_blame(params).expect("blame failed");
+    let json = extract_text(result);
+
+    assert_eq!(json["path"], "README.md");
+    assert_eq!(json["total_lines"], 1);
+    let blame = json["blame"].as_array().unwrap();
+    assert!(!blame.is_empty(), "blame should have entries");
+    assert_eq!(blame[0]["author"], "Alice");
 }
